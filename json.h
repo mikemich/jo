@@ -46,7 +46,7 @@ struct JsonNode
 	
 	/* only if parent is an object (NULL otherwise) */
 	char *key; /* Must be valid UTF-8. */
-	
+	size_t string_len; /* length of string_ in bytes, excluding null terminator */
 	JsonTag tag;
 	union {
 		/* JSON_BOOL */
@@ -93,6 +93,7 @@ JsonNode   *json_first_child    (const JsonNode *node);
 JsonNode *json_mknull(void);
 JsonNode *json_mkbool(bool b);
 JsonNode *json_mkstring(const char *s);
+JsonNode *json_mkstring_len(const char *s, size_t len);
 JsonNode *json_mknumber(double n);
 JsonNode *json_mkarray(void);
 JsonNode *json_mkobject(void);

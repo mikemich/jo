@@ -345,11 +345,10 @@ JsonNode *vnode(char *str, int flags)
 	
 			// If it got this far without valid JSON, just consider it a string
 			if (j == NULL) {
-				char *bp = content + strlen(content) - 1;
+				if (len > 0 && content[len - 1] == '\n') len--;
+				if (len > 0 && content[len - 1] == '\r') len--;
+				j = json_mkstring_len(content, len);
 	
-				if (*bp == '\n') *bp-- = 0;
-				if (*bp == '\r') *bp = 0;
-				j = json_mkstring(content);
 			}
 			free(content);
 			return (j);
@@ -751,6 +750,21 @@ int main(int argc, char **argv)
 		}
 		while ((buf = slurp_line(stdin, &in_len)) != NULL && in_len > 0) {
 			p = ttyin ? utf8_from_locale(buf, -1) : buf;
+			if (!ttyin && !(flags & FLAG_ARRAY)) {
+				char *eq = strchr(p, '=');
+				if (eq != NULL) {
+					size_t val_len = in_len - (size_t)(eq + 1 - p);
+					if (memchr(eq + 1, '\0', val_len) != NULL) {
+						JsonNode *val = json_mkstring_len(eq + 1, val_len);
+						char *key = p;
+						*eq = '\0';
+						if (!resolve_nested(flags, &key, key_delim, val, &json))
+							json_append_member(json, key, val);
+						free(buf);
+						continue;
+					}
+				}
+			}
 			append_kv(json, flags, key_delim, p);
 			if (ttyin) utf8_free(p);
 			if (buf) free(buf);

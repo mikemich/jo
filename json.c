@@ -126,6 +126,21 @@ static char *sb_finish(SB *sb)
 	return sb->start;
 }
 
+/*
+ * Like sb_finish but tolerates embedded NUL bytes in the buffer
+ * (which a JSON string parsed from "\u0000" can legitimately contain).
+ * Returns the buffer and writes the byte length (excluding the trailing
+ * NUL appended for C-string compatibility) into *out_len.
+ */
+static char *sb_finish_len(SB *sb, size_t *out_len)
+{
+	assert(sb->start <= sb->cur);
+	*sb->cur = 0;
+	if (out_len)
+		*out_len = (size_t)(sb->cur - sb->start);
+	return sb->start;
+}
+
 static void sb_free(SB *sb)
 {
 	free(sb->start);
@@ -223,13 +238,28 @@ static int utf8_validate_cz(const char *s)
 static bool utf8_validate(const char *s)
 {
 	int len;
-	
+
 	for (; *s != 0; s += len) {
 		len = utf8_validate_cz(s);
 		if (len == 0)
 			return false;
 	}
-	
+
+	return true;
+}
+
+/* Validate a UTF-8 string of known byte length (may contain embedded nulls). */
+static bool utf8_validate_len(const char *s, size_t len)
+{
+	int n;
+	const char *end = s + len;
+
+	while (s < end) {
+		n = utf8_validate_cz(s);
+		if (n == 0)
+			return false;
+		s += n;
+	}
 	return true;
 }
 
@@ -356,7 +386,7 @@ static void to_surrogate_pair(js_uchar_t unicode, uint16_t *uc, uint16_t *lc)
 #define is_digit(c) ((c) >= '0' && (c) <= '9')
 
 static bool parse_value     (const char **sp, JsonNode        **out);
-static bool parse_string    (const char **sp, char            **out);
+static bool parse_string    (const char **sp, char            **out, size_t *out_len);
 static bool parse_number    (const char **sp, double           *out);
 static bool parse_array     (const char **sp, JsonNode        **out);
 static bool parse_object    (const char **sp, JsonNode        **out);
@@ -367,7 +397,7 @@ static void skip_space      (const char **sp);
 
 static void emit_value              (SB *out, const JsonNode *node);
 static void emit_value_indented     (SB *out, const JsonNode *node, const char *space, int indent_level);
-static void emit_string             (SB *out, const char *str);
+static void emit_string             (SB *out, const char *str, size_t len);
 static void emit_number             (SB *out, double num);
 static void emit_array              (SB *out, const JsonNode *array);
 static void emit_array_indented     (SB *out, const JsonNode *array, const char *space, int indent_level);
@@ -416,8 +446,8 @@ char *json_encode_string(const char *str)
 	SB sb;
 	sb_init(&sb);
 	
-	emit_string(&sb, str);
-	
+	emit_string(&sb, str, strlen(str));
+
 	return sb_finish(&sb);
 }
 
@@ -534,16 +564,27 @@ JsonNode *json_mkbool(bool b)
 	return ret;
 }
 
-static JsonNode *mkstring(char *s)
+static JsonNode *mkstring(char *s, size_t len)
 {
 	JsonNode *ret = mknode(JSON_STRING);
 	ret->string_ = s;
+	ret->string_len = len;
 	return ret;
 }
 
 JsonNode *json_mkstring(const char *s)
 {
-	return mkstring(json_strdup(s));
+	return mkstring(json_strdup(s), strlen(s));
+}
+
+JsonNode *json_mkstring_len(const char *s, size_t len)
+{
+	char *buf = malloc(len + 1);
+	if (buf == NULL)
+		out_of_memory();
+	memcpy(buf, s, len);
+	buf[len] = '\0';
+	return mkstring(buf, len);
 }
 
 JsonNode *json_mknumber(double n)
@@ -751,9 +792,10 @@ static bool parse_value(const char **sp, JsonNode **out)
 		
 		case '"': {
 			char *str;
-			if (parse_string(&s, out ? &str : NULL)) {
+			size_t str_len;
+			if (parse_string(&s, out ? &str : NULL, out ? &str_len : NULL)) {
 				if (out)
-					*out = mkstring(str);
+					*out = mkstring(str, str_len);
 				*sp = s;
 				return true;
 			}
@@ -848,7 +890,7 @@ static bool parse_object(const char **sp, JsonNode **out)
 	}
 	
 	for (;;) {
-		if (!parse_string(&s, out ? &key : NULL))
+		if (!parse_string(&s, out ? &key : NULL, NULL))
 			goto failure;
 		skip_space(&s);
 		
@@ -887,7 +929,7 @@ failure:
 	return false;
 }
 
-bool parse_string(const char **sp, char **out)
+bool parse_string(const char **sp, char **out, size_t *out_len)
 {
 	const char *s = *sp;
 	SB sb;
@@ -947,9 +989,6 @@ bool parse_string(const char **sp, char **out)
 							goto failed; /* Incomplete surrogate pair. */
 						if (!from_surrogate_pair(uc, lc, &unicode))
 							goto failed; /* Invalid surrogate pair. */
-					} else if (uc == 0) {
-						/* Disallow "\u0000". */
-						goto failed;
 					} else {
 						unicode = uc;
 					}
@@ -992,7 +1031,9 @@ bool parse_string(const char **sp, char **out)
 	s++;
 	
 	if (out)
-		*out = sb_finish(&sb);
+		*out = sb_finish_len(&sb, out_len);
+	else if (out_len)
+		*out_len = 0;
 	*sp = s;
 	return true;
 
@@ -1079,7 +1120,7 @@ static void emit_value(SB *out, const JsonNode *node)
 			sb_puts(out, node->bool_ ? "true" : "false");
 			break;
 		case JSON_STRING:
-			emit_string(out, node->string_);
+			emit_string(out, node->string_, node->string_len);
 			break;
 		case JSON_NUMBER:
 			emit_number(out, node->number_);
@@ -1106,7 +1147,7 @@ void emit_value_indented(SB *out, const JsonNode *node, const char *space, int i
 			sb_puts(out, node->bool_ ? "true" : "false");
 			break;
 		case JSON_STRING:
-			emit_string(out, node->string_);
+			emit_string(out, node->string_, node->string_len);
 			break;
 		case JSON_NUMBER:
 			emit_number(out, node->number_);
@@ -1165,7 +1206,7 @@ static void emit_object(SB *out, const JsonNode *object)
 	
 	sb_putc(out, '{');
 	json_foreach(member, object) {
-		emit_string(out, member->key);
+		emit_string(out, member->key, strlen(member->key));
 		sb_putc(out, ':');
 		emit_value(out, member);
 		if (member->next != NULL)
@@ -1188,7 +1229,7 @@ static void emit_object_indented(SB *out, const JsonNode *object, const char *sp
 	while (member != NULL) {
 		for (i = 0; i < indent_level + 1; i++)
 			sb_puts(out, space);
-		emit_string(out, member->key);
+		emit_string(out, member->key, strlen(member->key));
 		sb_puts(out, ": ");
 		emit_value_indented(out, member, space, indent_level + 1);
 		
@@ -1200,27 +1241,36 @@ static void emit_object_indented(SB *out, const JsonNode *object, const char *sp
 	sb_putc(out, '}');
 }
 
-void emit_string(SB *out, const char *str)
+void emit_string(SB *out, const char *str, size_t len)
 {
 	bool escape_unicode = false;
 	const char *s = str;
+	const char *end = str + len;
 	char *b;
-	
-	assert(utf8_validate(str));
-	
+
+	assert(utf8_validate_len(str, len));
+
 	/*
 	 * 14 bytes is enough space to write up to two
 	 * \uXXXX escapes and two quotation marks.
 	 */
 	sb_need(out, 14);
 	b = out->cur;
-	
+
 	*b++ = '"';
-	while (*s != 0) {
+	while (s < end) {
 		unsigned char c = *s++;
 		
 		/* Encode the next character, and write it to b. */
 		switch (c) {
+			case '\0':
+				*b++ = '\\';
+				*b++ = 'u';
+				*b++ = '0';
+				*b++ = '0';
+				*b++ = '0';
+				*b++ = '0';
+				break;
 			case '"':
 				*b++ = '\\';
 				*b++ = '"';
@@ -1431,7 +1481,7 @@ bool json_check(const JsonNode *node, char errmsg[256])
 	} else if (node->tag == JSON_STRING) {
 		if (node->string_ == NULL)
 			problem("string_ is NULL");
-		if (!utf8_validate(node->string_))
+		if (!utf8_validate_len(node->string_, node->string_len))
 			problem("string_ contains invalid UTF-8");
 	} else if (node->tag == JSON_ARRAY || node->tag == JSON_OBJECT) {
 		JsonNode *head = node->children.head;
